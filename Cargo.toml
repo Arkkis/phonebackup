@@ -1,0 +1,16 @@
+[package]
+name = "phonebackup"
+version = "0.1.0"
+edition = "2024"
+description = "Back up and restore an iPhone from Linux, over USB or Wi-Fi"
+license = "MIT"
+rust-version = "1.95"
+
+[dependencies]
+eframe = "0.37.0"
+idevice = { version = "0.1.68", features = ["usbmuxd", "tcp", "mdns", "mobilebackup2", "pair", "rustls", "heartbeat"] }
+mdns-sd = "0.21.6"
+plist = "1.10.3"
+rfd = "0.17.2"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
+uuid = { version = "1.29.0", features = ["v4"] }
