@@ -1,0 +1,26 @@
+# Builds from this checkout: run `makepkg -si` in this directory.
+pkgname=phonebackup
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Back up and restore an iPhone from Linux, over USB or Wi-Fi'
+arch=(x86_64 aarch64)
+license=(MIT)
+depends=(gcc-libs glibc usbmuxd libxkbcommon wayland libglvnd)
+makedepends=(cargo)
+optdepends=('libx11: X11 session support'
+            'libxcursor: X11 session support'
+            'xdg-desktop-portal: folder picker')
+options=(!lto)
+
+build() {
+  cd "$startdir/.."
+  CARGO_TARGET_DIR="$srcdir/target" cargo build --release --locked
+}
+
+package() {
+  cd "$startdir/.."
+  install -Dm755 "$srcdir/target/release/phonebackup" "$pkgdir/usr/bin/phonebackup"
+  install -Dm644 packaging/phonebackup.desktop "$pkgdir/usr/share/applications/phonebackup.desktop"
+  install -Dm644 packaging/phonebackup.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/phonebackup.svg"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Phone Backup
+Comment=Back up and restore an iPhone over USB or Wi-Fi
+Exec=phonebackup
+Icon=phonebackup
+Terminal=false
+Categories=Utility;
+StartupWMClass=phonebackup

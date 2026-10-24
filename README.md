@@ -27,6 +27,19 @@ cargo build --release
 ./target/release/phonebackup
 ```
 
+## Install
+
+Any distro: run `packaging/appimage.sh`. It builds a single file, `packaging/Phone-Backup-x86_64.AppImage`, that you can copy anywhere and run. It doesn't include `usbmuxd`; the app offers to install it.
+
+Arch, CachyOS, Manjaro:
+
+```sh
+cd packaging
+makepkg -si
+```
+
+This installs `phonebackup`, a menu entry, and `usbmuxd`.
+
 ## Usage
 
 1. Plug the iPhone in over USB, unlock it, click **Trust this computer**, and tap **Trust** on the phone.
