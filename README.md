@@ -13,6 +13,7 @@ Not affiliated with Apple. iPhone is a trademark of Apple Inc.
 - Backup encryption on/off, so backups include saved passwords and Health data
 - Checks before restoring: Find My, iOS version, backup password
 - Progress with size, speed and time left; cancel (except mid-restore)
+- Storage: used/free space, apps by size (remove them), and a browser for photos, downloads and other media (save to PC or delete)
 
 ## Requirements
 

@@ -1,4 +1,4 @@
-// Device discovery, pairing, Wi-Fi sync, encryption, backup and restore on top of the `idevice` crate.
+// Device discovery, pairing, Wi-Fi sync, encryption, backup, restore and storage on top of the `idevice` crate.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -6,7 +6,10 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use idevice::afc::AfcClient;
+use idevice::afc::opcode::AfcFopenMode;
 use idevice::heartbeat::HeartbeatClient;
+use idevice::installation_proxy::InstallationProxyClient;
 use idevice::lockdown::LockdownClient;
 use idevice::mobilebackup2::{
     BackupDelegate, BackupProgress, FsBackupDelegate, MobileBackup2Client, RestoreOptions,
@@ -652,4 +655,152 @@ pub async fn install_usbmuxd() -> Result<String, String> {
             String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("unknown error")
         )),
     }
+}
+
+pub struct AppUsage {
+    pub id: String,
+    pub name: String,
+    pub app: u64,
+    pub data: u64,
+}
+
+pub struct Storage {
+    pub capacity: u64,
+    pub free: u64,
+    /// User-installed apps, biggest first.
+    pub apps: Vec<AppUsage>,
+}
+
+pub struct FileEntry {
+    pub path: String,
+    pub name: String,
+    pub dir: bool,
+    pub size: u64,
+}
+
+fn join(dir: &str, name: &str) -> String {
+    format!("{}/{name}", dir.trim_end_matches('/'))
+}
+
+/// Space used and free, plus every user app with its size.
+pub async fn storage(dev: &Device, log: Log<'_>) -> Result<Storage, String> {
+    let p = provider(dev, log).await?;
+    let mut l = session(&dev.udid, p.as_ref()).await.map_err(friendly)?;
+    let du = l.get_value(None, Some("com.apple.disk_usage")).await.map_err(friendly)?.into_dictionary().unwrap_or_default();
+    let n = |k: &str| du.get(k).and_then(|v| v.as_unsigned_integer()).unwrap_or(0);
+    let _beat = beat(&dev.transport, p.as_ref()).await?;
+    let mut ip = InstallationProxyClient::connect(p.as_ref()).await.map_err(friendly)?;
+    let mut opts = plist::Dictionary::new();
+    opts.insert("ApplicationType".into(), "User".into());
+    opts.insert(
+        "ReturnAttributes".into(),
+        ["CFBundleIdentifier", "CFBundleDisplayName", "CFBundleName", "StaticDiskUsage", "DynamicDiskUsage"]
+            .map(plist::Value::from)
+            .to_vec()
+            .into(),
+    );
+    let mut apps: Vec<AppUsage> = ip
+        .browse(Some(opts.into()))
+        .await
+        .map_err(friendly)?
+        .into_iter()
+        .filter_map(|v| v.into_dictionary())
+        .map(|d| {
+            let s = |k: &str| d.get(k).and_then(|v| v.as_string()).filter(|s| !s.is_empty()).map(str::to_string);
+            let u = |k: &str| d.get(k).and_then(|v| v.as_unsigned_integer()).unwrap_or(0);
+            let id = s("CFBundleIdentifier").unwrap_or_default();
+            AppUsage {
+                name: s("CFBundleDisplayName").or_else(|| s("CFBundleName")).unwrap_or_else(|| id.clone()),
+                id,
+                app: u("StaticDiskUsage"),
+                data: u("DynamicDiskUsage"),
+            }
+        })
+        .collect();
+    apps.sort_by_key(|a| std::cmp::Reverse(a.app + a.data));
+    Ok(Storage { capacity: n("TotalDataCapacity"), free: n("AmountDataAvailable"), apps })
+}
+
+pub async fn uninstall(dev: &Device, id: &str, name: &str, log: Log<'_>) -> Result<String, String> {
+    let p = provider(dev, log).await?;
+    let _beat = beat(&dev.transport, p.as_ref()).await?;
+    let mut ip = InstallationProxyClient::connect(p.as_ref()).await.map_err(friendly)?;
+    ip.uninstall(id, None).await.map_err(friendly)?;
+    Ok(format!("{name} was removed from the iPhone."))
+}
+
+async fn afc(dev: &Device, log: Log<'_>) -> Result<(AfcClient, Beat), String> {
+    let p = provider(dev, log).await?;
+    let b = beat(&dev.transport, p.as_ref()).await?;
+    Ok((AfcClient::connect(p.as_ref()).await.map_err(friendly)?, b))
+}
+
+async fn children(afc: &mut AfcClient, dir: &str) -> Result<Vec<String>, IdeviceError> {
+    Ok(afc.list_dir(dir).await?.into_iter().filter(|n| n != "." && n != "..").map(|n| join(dir, &n)).collect())
+}
+
+/// Total size of a file or folder. Unreadable entries count as 0.
+async fn du(afc: &mut AfcClient, path: &str) -> u64 {
+    let mut stack = vec![path.to_string()];
+    let mut total = 0;
+    while let Some(p) = stack.pop() {
+        match afc.get_file_info(&p).await {
+            Ok(i) if i.st_ifmt == "S_IFDIR" => stack.extend(children(afc, &p).await.unwrap_or_default()),
+            Ok(i) => total += i.size as u64,
+            Err(_) => {}
+        }
+    }
+    total
+}
+
+/// The phone's media area (photos, downloads, …) at `dir`, biggest first.
+pub async fn list_files(dev: &Device, dir: &str, log: Log<'_>) -> Result<Vec<FileEntry>, String> {
+    let (mut afc, _beat) = afc(dev, log).await?;
+    let mut out = Vec::new();
+    for path in children(&mut afc, dir).await.map_err(friendly)? {
+        let dir = afc.get_file_info(&path).await.is_ok_and(|i| i.st_ifmt == "S_IFDIR");
+        let size = du(&mut afc, &path).await;
+        let name = path.rsplit('/').next().unwrap_or_default().to_string();
+        out.push(FileEntry { path, name, dir, size });
+    }
+    out.sort_by_key(|e| std::cmp::Reverse(e.size));
+    Ok(out)
+}
+
+/// Copies a file or folder from the phone into `dest`.
+pub async fn download(dev: &Device, path: &str, dest: &Path, log: Log<'_>) -> Result<String, String> {
+    let (mut afc, _beat) = afc(dev, log).await?;
+    let name = path.rsplit('/').next().unwrap_or("iPhone");
+    let mut stack = vec![(path.to_string(), dest.join(name))];
+    let (mut files, mut bytes) = (0, 0u64);
+    while let Some((src, dst)) = stack.pop() {
+        if afc.get_file_info(&src).await.map_err(friendly)?.st_ifmt == "S_IFDIR" {
+            std::fs::create_dir_all(&dst).map_err(io_err)?;
+            for c in children(&mut afc, &src).await.map_err(friendly)? {
+                let n = c.rsplit('/').next().unwrap_or_default().to_string();
+                stack.push((c, dst.join(n)));
+            }
+            continue;
+        }
+        log(format!("Saving {src}"));
+        let mut out = std::fs::File::create(&dst).map_err(io_err)?;
+        let mut f = afc.open(&src, AfcFopenMode::RdOnly).await.map_err(friendly)?;
+        loop {
+            let chunk = f.read_n(1 << 20).await.map_err(friendly)?;
+            if chunk.is_empty() {
+                break;
+            }
+            bytes += chunk.len() as u64;
+            std::io::Write::write_all(&mut out, &chunk).map_err(io_err)?;
+        }
+        f.close().await.map_err(friendly)?;
+        files += 1;
+    }
+    Ok(format!("Saved {files} file(s), {:.1} MB, to {}.", bytes as f64 / 1e6, dest.display()))
+}
+
+pub async fn delete(dev: &Device, path: &str, log: Log<'_>) -> Result<String, String> {
+    let (mut afc, _beat) = afc(dev, log).await?;
+    afc.remove_all(path).await.map_err(friendly)?;
+    Ok(format!("Deleted {path}."))
 }

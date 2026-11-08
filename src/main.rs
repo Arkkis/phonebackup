@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use device::{BackupEntry, Device, Hint, RestoreChoice, Scan, Scanner};
+use device::{BackupEntry, Device, FileEntry, Hint, RestoreChoice, Scan, Scanner, Storage};
 use eframe::egui::{self, Color32, RichText};
 use idevice::mobilebackup2::BackupProgress;
 
@@ -19,6 +19,13 @@ enum Msg {
     Log(String),
     Progress(BackupProgress),
     Done(Result<String, String>),
+    Storage(Storage),
+    Files(String, Vec<FileEntry>),
+}
+
+enum Delete {
+    App { id: String, name: String },
+    File(String),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -66,6 +73,9 @@ struct App {
     encrypt: Option<Encrypt>,
     confirm_quit: bool,
     quit_ok: bool,
+    storage: Option<Storage>,
+    files: Option<(String, Vec<FileEntry>)>,
+    confirm_delete: Option<Delete>,
 }
 
 impl App {
@@ -96,6 +106,9 @@ impl App {
             encrypt: None,
             confirm_quit: false,
             quit_ok: false,
+            storage: None,
+            files: None,
+            confirm_delete: None,
         }
     }
 
@@ -170,6 +183,8 @@ impl App {
                     self.last_scan = Some(Instant::now());
                     if self.selected.as_ref().is_none_or(|u| !s.devices.iter().any(|d| &d.udid == u)) {
                         self.selected = s.devices.first().map(|d| d.udid.clone());
+                        self.storage = None;
+                        self.files = None;
                     }
                     self.scan = s;
                 }
@@ -180,6 +195,8 @@ impl App {
                     }
                 }
                 Msg::Done(r) => self.end_job(r),
+                Msg::Storage(s) => self.storage = Some(s),
+                Msg::Files(dir, f) => self.files = Some((dir, f)),
             }
         }
     }
@@ -317,6 +334,144 @@ impl App {
                 self.confirm_restore = true;
             }
         });
+    }
+
+    /// Runs `op` (if any), then reloads storage or the open folder so the view stays current.
+    fn storage_job(&mut self, ctx: &egui::Context, dev: Device, title: &str, op: Option<Delete>, files: Option<String>) {
+        let tx = self.tx.clone();
+        self.run(ctx, Kind::Other, title, move |log, _| async move {
+            let done = match &op {
+                Some(Delete::App { id, name }) => Some(device::uninstall(&dev, id, name, &*log).await?),
+                Some(Delete::File(p)) => Some(device::delete(&dev, p, &*log).await?),
+                None => None,
+            };
+            if let Some(dir) = files {
+                let f = device::list_files(&dev, &dir, &*log).await?;
+                let n = f.len();
+                let _ = tx.send(Msg::Files(dir.clone(), f));
+                return Ok(done.unwrap_or_else(|| format!("{dir}: {n} item(s).")));
+            }
+            let s = device::storage(&dev, &*log).await?;
+            let text = format!("{} free of {}.", size(s.free), size(s.capacity));
+            let _ = tx.send(Msg::Storage(s));
+            Ok(done.unwrap_or(text))
+        });
+    }
+
+    fn storage_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(dev) = self.device().filter(|d| d.info.paired) else { return };
+        let mut job: Option<(&str, Option<Delete>, Option<String>)> = None;
+        let mut save = None;
+        card(ui, "Storage", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Check storage").clicked() {
+                    job = Some(("Checking storage", None, None));
+                }
+                if ui.button("Browse files").clicked() {
+                    job = Some(("Reading files", None, Some("/".into())));
+                }
+            });
+            if let Some(s) = &self.storage {
+                let used = s.capacity.saturating_sub(s.free);
+                ui.add(egui::ProgressBar::new(used as f32 / s.capacity.max(1) as f32)
+                    .text(format!("{} used of {} · {} free", size(used), size(s.capacity), size(s.free))));
+                let apps: u64 = s.apps.iter().map(|a| a.app + a.data).sum();
+                egui::CollapsingHeader::new(format!("Apps: {} in {}", size(apps), s.apps.len())).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("apps").max_height(320.0).show(ui, |ui| {
+                        egui::Grid::new("apps_grid").striped(true).num_columns(3).show(ui, |ui| {
+                            for a in &s.apps {
+                                ui.label(&a.name).on_hover_text(&a.id);
+                                ui.label(size(a.app + a.data)).on_hover_text(format!("App {} + data {}", size(a.app), size(a.data)));
+                                if ui.small_button("Remove…").clicked() {
+                                    self.confirm_delete = Some(Delete::App { id: a.id.clone(), name: a.name.clone() });
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                });
+                ui.label(RichText::new("The rest is iOS, Messages, caches and other system data, which the iPhone doesn't break down over USB.").weak());
+            }
+            if let Some((dir, entries)) = &self.files {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if dir != "/" && ui.small_button("⬆ Up").clicked() {
+                        let up = dir.rsplit_once('/').map(|(a, _)| a).filter(|a| !a.is_empty()).unwrap_or("/");
+                        job = Some(("Reading files", None, Some(up.into())));
+                    }
+                    ui.monospace(dir);
+                });
+                ui.label(RichText::new("Photos, videos, downloads and other shared media. App data isn't reachable here.").weak());
+                egui::ScrollArea::vertical().id_salt("files").max_height(320.0).show(ui, |ui| {
+                    egui::Grid::new("files_grid").striped(true).num_columns(4).show(ui, |ui| {
+                        for e in entries {
+                            if e.dir {
+                                if ui.link(format!("📁 {}", e.name)).clicked() {
+                                    job = Some(("Reading files", None, Some(e.path.clone())));
+                                }
+                            } else {
+                                ui.label(&e.name);
+                            }
+                            ui.label(size(e.size));
+                            if ui.small_button("Save…").clicked()
+                                && let Some(dest) = rfd::FileDialog::new().pick_folder()
+                            {
+                                save = Some((e.path.clone(), e.name.clone(), dest));
+                            }
+                            if ui.small_button("Delete…").clicked() {
+                                self.confirm_delete = Some(Delete::File(e.path.clone()));
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+            }
+        });
+        if let Some((path, name, dest)) = save {
+            let d = dev.clone();
+            self.run(ctx, Kind::Other, &format!("Saving {name}"), move |log, _| async move {
+                device::download(&d, &path, &dest, &*log).await
+            });
+        }
+        if let Some((title, op, files)) = job {
+            self.storage_job(ctx, dev, title, op, files);
+        }
+    }
+
+    fn delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dev) = self.device() else {
+            self.confirm_delete = None;
+            return;
+        };
+        let (title, what) = match &self.confirm_delete {
+            Some(Delete::App { name, .. }) => ("Remove app?", format!("Remove {name} and all its data from {}?", dev.info.name)),
+            Some(Delete::File(p)) => ("Delete from iPhone?", format!("Delete {p} from {}?", dev.info.name)),
+            None => return,
+        };
+        let photos = matches!(&self.confirm_delete, Some(Delete::File(p)) if p.starts_with("/DCIM") || p.starts_with("/PhotoData"));
+        let (mut go, mut close) = (false, false);
+        egui::Window::new(title).collapsible(false).resizable(false).show(ctx, |ui| {
+            ui.label(what);
+            ui.label(RichText::new("This can't be undone.").strong());
+            if photos {
+                ui.label(RichText::new("✖ Delete photos and videos in the Photos app instead. Deleting them here leaves broken items in Photos.").color(ui.visuals().error_fg_color));
+            }
+            ui.horizontal(|ui| {
+                go = ui.add_enabled(!photos, egui::Button::new("Delete")).clicked();
+                close = ui.button("Cancel").clicked();
+            });
+        });
+        if close {
+            self.confirm_delete = None;
+        }
+        if go && let Some(op) = self.confirm_delete.take() {
+            let files = match &op {
+                Delete::File(p) => Some(p.rsplit_once('/').map(|(a, _)| a).filter(|a| !a.is_empty()).unwrap_or("/").to_string()),
+                Delete::App { .. } => None,
+            };
+            let title = if files.is_some() { "Deleting" } else { "Removing app" };
+            self.storage_job(ctx, dev, title, Some(op), files);
+        }
     }
 
     fn status(&mut self, ui: &mut egui::Ui) {
@@ -569,13 +724,14 @@ impl eframe::App for App {
             self.confirm_quit = true;
         }
 
-        let modal = self.confirm_restore || self.encrypt.is_some() || self.confirm_quit;
+        let modal = self.confirm_restore || self.encrypt.is_some() || self.confirm_quit || self.confirm_delete.is_some();
         egui::CentralPanel::default().show(root, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.add_enabled_ui(self.job.is_none() && !modal, |ui| {
                     self.device_card(ui, ctx);
                     self.backup_card(ui, ctx);
                     self.restore_card(ui);
+                    self.storage_card(ui, ctx);
                 });
                 self.status(ui);
             });
@@ -586,6 +742,9 @@ impl eframe::App for App {
         }
         if self.encrypt.is_some() {
             self.encrypt_dialog(ctx);
+        }
+        if self.confirm_delete.is_some() {
+            self.delete_dialog(ctx);
         }
         if self.confirm_quit {
             self.quit_dialog(ctx);

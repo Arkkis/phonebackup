@@ -8,7 +8,7 @@ rust-version = "1.95"
 
 [dependencies]
 eframe = "0.37.0"
-idevice = { version = "0.1.68", features = ["usbmuxd", "tcp", "mdns", "mobilebackup2", "pair", "rustls", "heartbeat"] }
+idevice = { version = "0.1.68", features = ["usbmuxd", "tcp", "mdns", "mobilebackup2", "pair", "rustls", "heartbeat", "installation_proxy", "afc"] }
 mdns-sd = "0.21.6"
 plist = "1.10.3"
 rfd = "0.17.2"
